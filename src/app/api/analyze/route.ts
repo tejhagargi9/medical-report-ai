@@ -1,5 +1,4 @@
 import { NextRequest, NextResponse } from "next/server";
-import { createWorker } from "tesseract.js";
 import { ExtractionMethod, Finding, ReportAnalysis } from "@/lib/types";
 
 export const runtime = "nodejs";
@@ -78,16 +77,14 @@ function buildPrompt(extractedText: string) {
   return `${SYSTEM_PROMPT}\n\n--- EXTRACTED REPORT TEXT ---\n${extractedText}\n--- END REPORT TEXT ---`;
 }
 
-async function runOcr(buffer: Buffer): Promise<string> {
-  // /tmp is the only writable directory on Vercel's serverless filesystem;
-  // tesseract.js otherwise defaults to the (read-only) working directory.
-  const worker = await createWorker("eng", 1, { cachePath: "/tmp" });
-  try {
-    const { data } = await worker.recognize(buffer);
-    return data.text.trim();
-  } finally {
-    await worker.terminate();
-  }
+const OCR_PROMPT = `Transcribe all text visible in this image exactly as written, preserving line breaks, tables, and layout as plain text. Do not summarize, translate, explain, or add any commentary — output only the transcribed text. If the image contains no readable text, output nothing.`;
+
+async function runOcr(buffer: Buffer, mimeType: string): Promise<string> {
+  const text = await callGeminiApi([
+    { text: OCR_PROMPT },
+    { inlineData: { mimeType, data: buffer.toString("base64") } },
+  ]);
+  return text.trim();
 }
 
 async function extractFromPdf(
@@ -106,7 +103,7 @@ async function extractFromPdf(
     // few pages and run OCR on each, same as we would for an image upload.
     const screenshots = await parser.getScreenshot({ scale: 2, first: 3 });
     const pageTexts = await Promise.all(
-      screenshots.pages.map((page) => runOcr(Buffer.from(page.data)))
+      screenshots.pages.map((page) => runOcr(Buffer.from(page.data), "image/png"))
     );
     return { text: pageTexts.join("\n\n").trim(), method: "ocr" };
   } finally {
@@ -114,8 +111,8 @@ async function extractFromPdf(
   }
 }
 
-async function extractFromImage(buffer: Buffer): Promise<string> {
-  return runOcr(buffer);
+async function extractFromImage(buffer: Buffer, mimeType: string): Promise<string> {
+  return runOcr(buffer, mimeType);
 }
 
 const RETRYABLE_STATUS = new Set([429, 500, 503]);
@@ -125,7 +122,9 @@ function wait(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function callGemini(extractedText: string): Promise<GeminiAnalysis> {
+type GeminiPart = { text: string } | { inlineData: { mimeType: string; data: string } };
+
+async function callGeminiApi(parts: GeminiPart[], responseSchema?: object): Promise<string> {
   const apiKey = process.env.GOOGLE_API_KEY;
   if (!apiKey) {
     throw new Error("GOOGLE_API_KEY is not configured on the server.");
@@ -140,11 +139,15 @@ async function callGemini(extractedText: string): Promise<GeminiAnalysis> {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          contents: [{ role: "user", parts: [{ text: buildPrompt(extractedText) }] }],
-          generationConfig: {
-            responseMimeType: "application/json",
-            responseSchema: RESPONSE_SCHEMA,
-          },
+          contents: [{ role: "user", parts }],
+          ...(responseSchema
+            ? {
+                generationConfig: {
+                  responseMimeType: "application/json",
+                  responseSchema,
+                },
+              }
+            : {}),
         }),
       }
     );
@@ -153,9 +156,9 @@ async function callGemini(extractedText: string): Promise<GeminiAnalysis> {
       const json = await res.json();
       const text = json.candidates?.[0]?.content?.parts?.[0]?.text;
       if (!text) {
-        throw new Error("Gemini returned no analysis content.");
+        throw new Error("Gemini returned no content.");
       }
-      return JSON.parse(text) as GeminiAnalysis;
+      return text;
     }
 
     const errBody = await res.text();
@@ -168,6 +171,11 @@ async function callGemini(extractedText: string): Promise<GeminiAnalysis> {
   }
 
   throw lastError ?? new Error("Gemini request failed.");
+}
+
+async function callGemini(extractedText: string): Promise<GeminiAnalysis> {
+  const text = await callGeminiApi([{ text: buildPrompt(extractedText) }], RESPONSE_SCHEMA);
+  return JSON.parse(text) as GeminiAnalysis;
 }
 
 export async function POST(req: NextRequest) {
@@ -206,7 +214,7 @@ export async function POST(req: NextRequest) {
       extractedText = result.text;
       extractionMethod = result.method;
     } else {
-      extractedText = await extractFromImage(buffer);
+      extractedText = await extractFromImage(buffer, file.type);
       extractionMethod = "ocr";
     }
 
