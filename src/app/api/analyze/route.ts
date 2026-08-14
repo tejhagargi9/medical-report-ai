@@ -3,11 +3,14 @@ import { createWorker } from "tesseract.js";
 import { ExtractionMethod, Finding, ReportAnalysis } from "@/lib/types";
 
 export const runtime = "nodejs";
+// OCR + Gemini can take longer than Vercel's default 10s function timeout.
+export const maxDuration = 60;
 
 const PDF_TYPE = "application/pdf";
 const IMAGE_TYPES = ["image/png", "image/jpeg", "image/jpg"];
 const MIN_TEXT_LENGTH = 30;
-const MAX_FILE_BYTES = 15 * 1024 * 1024;
+// Kept under Vercel's serverless request body limit (~4.5MB).
+const MAX_FILE_BYTES = 4 * 1024 * 1024;
 
 const GEMINI_MODEL = "gemini-3.1-flash-lite";
 
@@ -76,7 +79,9 @@ function buildPrompt(extractedText: string) {
 }
 
 async function runOcr(buffer: Buffer): Promise<string> {
-  const worker = await createWorker("eng");
+  // /tmp is the only writable directory on Vercel's serverless filesystem;
+  // tesseract.js otherwise defaults to the (read-only) working directory.
+  const worker = await createWorker("eng", 1, { cachePath: "/tmp" });
   try {
     const { data } = await worker.recognize(buffer);
     return data.text.trim();
